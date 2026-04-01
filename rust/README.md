@@ -118,6 +118,13 @@ cd rust
 cargo run -p rusty-claude-cli -- --allowedTools read,glob
 ```
 
+Bootstrap Claude project files for the current repo:
+
+```bash
+cd rust
+cargo run -p rusty-claude-cli -- init
+```
+
 ### 2) REPL mode
 
 Start the interactive shell:
@@ -190,7 +197,7 @@ cargo run -p rusty-claude-cli -- --resume ~/.claude/sessions/session-123456.json
 - `/resume <session-id-or-path>` — load a saved session into the REPL
 - `/config [env|hooks|model]` — inspect discovered Claude config
 - `/memory` — inspect loaded instruction memory files
-- `/init` — create a starter `CLAUDE.md`
+- `/init` — bootstrap `.claude.json`, `.claude/`, `CLAUDE.md`, and local ignore rules
 - `/diff` — show the current git diff for the workspace
 - `/version` — print version and build metadata locally
 - `/export [file]` — export the current conversation transcript

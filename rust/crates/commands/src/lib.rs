@@ -107,7 +107,7 @@ const SLASH_COMMAND_SPECS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "init",
-        summary: "Create a starter CLAUDE.md for this repo",
+        summary: "Bootstrap Claude project files for this repo",
         argument_hint: None,
         resume_supported: true,
     },

@@ -1,9 +1,9 @@
+mod init;
 mod input;
 mod render;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
-use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::TcpListener;
@@ -21,8 +21,8 @@ use commands::{
     render_slash_command_help, resume_supported_slash_commands, slash_command_specs, SlashCommand,
 };
 use compat_harness::{extract_manifest, UpstreamPaths};
+use init::initialize_repo;
 use render::{Spinner, TerminalRenderer};
-use reqwest::blocking::Client;
 use runtime::{
     clear_oauth_credentials, generate_pkce_pair, generate_state, load_system_prompt,
     parse_oauth_callback_request_target, save_oauth_credentials, ApiClient, ApiRequest,
@@ -31,9 +31,7 @@ use runtime::{
     OAuthTokenExchangeRequest, PermissionMode, PermissionPolicy, ProjectContext, RuntimeError,
     Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
 };
-use serde::Deserialize;
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use tools::{execute_tool, mvp_tool_specs, ToolSpec};
 
 const DEFAULT_MODEL: &str = "claude-sonnet-4-20250514";
@@ -43,18 +41,6 @@ const DEFAULT_OAUTH_CALLBACK_PORT: u16 = 4545;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_TARGET: Option<&str> = option_env!("TARGET");
 const GIT_SHA: Option<&str> = option_env!("GIT_SHA");
-const SELF_UPDATE_REPOSITORY: &str = "instructkr/clawd-code";
-const SELF_UPDATE_LATEST_RELEASE_URL: &str =
-    "https://api.github.com/repos/instructkr/clawd-code/releases/latest";
-const SELF_UPDATE_USER_AGENT: &str = "rusty-claude-cli-self-update";
-const CHECKSUM_ASSET_CANDIDATES: &[&str] = &[
-    "SHA256SUMS",
-    "SHA256SUMS.txt",
-    "sha256sums",
-    "sha256sums.txt",
-    "checksums.txt",
-    "checksums.sha256",
-];
 
 type AllowedToolSet = BTreeSet<String>;
 
@@ -76,7 +62,6 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::BootstrapPlan => print_bootstrap_plan(),
         CliAction::PrintSystemPrompt { cwd, date } => print_system_prompt(cwd, date),
         CliAction::Version => print_version(),
-        CliAction::SelfUpdate => run_self_update()?,
         CliAction::ResumeSession {
             session_path,
             commands,
@@ -91,6 +76,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             .run_turn_with_output(&prompt, output_format)?,
         CliAction::Login => run_login()?,
         CliAction::Logout => run_logout()?,
+        CliAction::Init => run_init()?,
         CliAction::Repl {
             model,
             allowed_tools,
@@ -110,7 +96,6 @@ enum CliAction {
         date: String,
     },
     Version,
-    SelfUpdate,
     ResumeSession {
         session_path: PathBuf,
         commands: Vec<String>,
@@ -124,6 +109,7 @@ enum CliAction {
     },
     Login,
     Logout,
+    Init,
     Repl {
         model: String,
         allowed_tools: Option<AllowedToolSet>,
@@ -246,9 +232,9 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "dump-manifests" => Ok(CliAction::DumpManifests),
         "bootstrap-plan" => Ok(CliAction::BootstrapPlan),
         "system-prompt" => parse_system_prompt_args(&rest[1..]),
-        "self-update" => Ok(CliAction::SelfUpdate),
         "login" => Ok(CliAction::Login),
         "logout" => Ok(CliAction::Logout),
+        "init" => Ok(CliAction::Init),
         "prompt" => {
             let prompt = rest[1..].join(" ");
             if prompt.trim().is_empty() {
@@ -553,375 +539,6 @@ fn print_version() {
     println!("{}", render_version_report());
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-struct GitHubRelease {
-    tag_name: String,
-    #[serde(default)]
-    body: String,
-    #[serde(default)]
-    assets: Vec<GitHubReleaseAsset>,
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-struct GitHubReleaseAsset {
-    name: String,
-    browser_download_url: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct SelectedReleaseAssets {
-    binary: GitHubReleaseAsset,
-    checksum: GitHubReleaseAsset,
-}
-
-fn run_self_update() -> Result<(), Box<dyn std::error::Error>> {
-    let Some(release) = fetch_latest_release()? else {
-        println!(
-            "{}",
-            render_update_report(
-                "No published release available",
-                Some(VERSION),
-                None,
-                Some("GitHub latest release endpoint returned no published release for instructkr/clawd-code."),
-                None,
-            )
-        );
-        return Ok(());
-    };
-
-    let latest_version = normalize_version_tag(&release.tag_name);
-    if !is_newer_version(VERSION, &latest_version) {
-        println!(
-            "{}",
-            render_update_report(
-                "Already up to date",
-                Some(VERSION),
-                Some(&latest_version),
-                Some("Current binary already matches the latest published release."),
-                Some(&release.body),
-            )
-        );
-        return Ok(());
-    }
-
-    let selected = match select_release_assets(&release) {
-        Ok(selected) => selected,
-        Err(message) => {
-            println!(
-                "{}",
-                render_update_report(
-                    "Release found, but no installable asset matched this platform",
-                    Some(VERSION),
-                    Some(&latest_version),
-                    Some(&message),
-                    Some(&release.body),
-                )
-            );
-            return Ok(());
-        }
-    };
-
-    let client = build_self_update_client()?;
-    let binary_bytes = download_bytes(&client, &selected.binary.browser_download_url)?;
-    let checksum_manifest = download_text(&client, &selected.checksum.browser_download_url)?;
-    let expected_checksum = parse_checksum_for_asset(&checksum_manifest, &selected.binary.name)
-        .ok_or_else(|| {
-            format!(
-                "checksum manifest did not contain an entry for {}",
-                selected.binary.name
-            )
-        })?;
-    let actual_checksum = sha256_hex(&binary_bytes);
-    if actual_checksum != expected_checksum {
-        return Err(format!(
-            "downloaded asset checksum mismatch for {} (expected {}, got {})",
-            selected.binary.name, expected_checksum, actual_checksum
-        )
-        .into());
-    }
-
-    replace_current_executable(&binary_bytes)?;
-
-    println!(
-        "{}",
-        render_update_report(
-            "Update installed",
-            Some(VERSION),
-            Some(&latest_version),
-            Some(&format!(
-                "Installed {} from GitHub release assets for {}.",
-                selected.binary.name,
-                current_target()
-            )),
-            Some(&release.body),
-        )
-    );
-    Ok(())
-}
-
-fn fetch_latest_release() -> Result<Option<GitHubRelease>, Box<dyn std::error::Error>> {
-    let client = build_self_update_client()?;
-    let response = client
-        .get(SELF_UPDATE_LATEST_RELEASE_URL)
-        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
-        .send()?;
-
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(None);
-    }
-
-    let response = response.error_for_status()?;
-    Ok(Some(response.json()?))
-}
-
-fn build_self_update_client() -> Result<Client, reqwest::Error> {
-    Client::builder().user_agent(SELF_UPDATE_USER_AGENT).build()
-}
-
-fn download_bytes(client: &Client, url: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let response = client.get(url).send()?.error_for_status()?;
-    Ok(response.bytes()?.to_vec())
-}
-
-fn download_text(client: &Client, url: &str) -> Result<String, Box<dyn std::error::Error>> {
-    let response = client.get(url).send()?.error_for_status()?;
-    Ok(response.text()?)
-}
-
-fn normalize_version_tag(version: &str) -> String {
-    version.trim().trim_start_matches('v').to_string()
-}
-
-fn is_newer_version(current: &str, latest: &str) -> bool {
-    compare_versions(latest, current).is_gt()
-}
-
-fn current_target() -> String {
-    BUILD_TARGET.map_or_else(default_target_triple, str::to_string)
-}
-
-fn release_asset_candidates() -> Vec<String> {
-    let mut candidates = target_name_candidates()
-        .into_iter()
-        .flat_map(|target| {
-            let mut names = vec![format!("rusty-claude-cli-{target}")];
-            if env::consts::OS == "windows" {
-                names.push(format!("rusty-claude-cli-{target}.exe"));
-            }
-            names
-        })
-        .collect::<Vec<_>>();
-    if env::consts::OS == "windows" {
-        candidates.push("rusty-claude-cli.exe".to_string());
-    }
-    candidates.push("rusty-claude-cli".to_string());
-    candidates.sort();
-    candidates.dedup();
-    candidates
-}
-
-fn select_release_assets(release: &GitHubRelease) -> Result<SelectedReleaseAssets, String> {
-    let binary = release_asset_candidates()
-        .into_iter()
-        .find_map(|candidate| {
-            release
-                .assets
-                .iter()
-                .find(|asset| asset.name == candidate)
-                .cloned()
-        })
-        .ok_or_else(|| {
-            format!(
-                "no binary asset matched target {} (expected one of: {})",
-                current_target(),
-                release_asset_candidates().join(", ")
-            )
-        })?;
-
-    let checksum = CHECKSUM_ASSET_CANDIDATES
-        .iter()
-        .find_map(|candidate| {
-            release
-                .assets
-                .iter()
-                .find(|asset| asset.name == *candidate)
-                .cloned()
-        })
-        .ok_or_else(|| {
-            format!(
-                "release did not include a checksum manifest (expected one of: {})",
-                CHECKSUM_ASSET_CANDIDATES.join(", ")
-            )
-        })?;
-
-    Ok(SelectedReleaseAssets { binary, checksum })
-}
-
-fn parse_checksum_for_asset(manifest: &str, asset_name: &str) -> Option<String> {
-    manifest.lines().find_map(|line| {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            return None;
-        }
-        if let Some((left, right)) = trimmed.split_once(" = ") {
-            return left
-                .strip_prefix("SHA256 (")
-                .and_then(|value| value.strip_suffix(')'))
-                .filter(|file| *file == asset_name)
-                .map(|_| right.to_ascii_lowercase());
-        }
-        let mut parts = trimmed.split_whitespace();
-        let checksum = parts.next()?;
-        let file = parts
-            .next_back()
-            .or_else(|| parts.next())?
-            .trim_start_matches('*');
-        (file == asset_name).then(|| checksum.to_ascii_lowercase())
-    })
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
-}
-
-fn replace_current_executable(binary_bytes: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
-    let current = env::current_exe()?;
-    replace_executable_at(&current, binary_bytes)
-}
-
-fn replace_executable_at(
-    current: &Path,
-    binary_bytes: &[u8],
-) -> Result<(), Box<dyn std::error::Error>> {
-    let temp_path = current.with_extension("download");
-    let backup_path = current.with_extension("bak");
-
-    if backup_path.exists() {
-        fs::remove_file(&backup_path)?;
-    }
-    fs::write(&temp_path, binary_bytes)?;
-    copy_executable_permissions(current, &temp_path)?;
-
-    fs::rename(current, &backup_path)?;
-    if let Err(error) = fs::rename(&temp_path, current) {
-        let _ = fs::rename(&backup_path, current);
-        let _ = fs::remove_file(&temp_path);
-        return Err(format!("failed to replace current executable: {error}").into());
-    }
-
-    if let Err(error) = fs::remove_file(&backup_path) {
-        eprintln!(
-            "warning: failed to remove self-update backup {}: {error}",
-            backup_path.display()
-        );
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn copy_executable_permissions(
-    source: &Path,
-    destination: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    use std::os::unix::fs::PermissionsExt;
-
-    let mode = fs::metadata(source)?.permissions().mode();
-    fs::set_permissions(destination, fs::Permissions::from_mode(mode))?;
-    Ok(())
-}
-
-#[cfg(not(unix))]
-fn copy_executable_permissions(
-    _source: &Path,
-    _destination: &Path,
-) -> Result<(), Box<dyn std::error::Error>> {
-    Ok(())
-}
-
-fn render_update_report(
-    result: &str,
-    current_version: Option<&str>,
-    latest_version: Option<&str>,
-    detail: Option<&str>,
-    changelog: Option<&str>,
-) -> String {
-    let mut report = String::from(
-        "Self-update
-",
-    );
-    let _ = writeln!(report, "  Repository       {SELF_UPDATE_REPOSITORY}");
-    let _ = writeln!(report, "  Result           {result}");
-    if let Some(current_version) = current_version {
-        let _ = writeln!(report, "  Current version  {current_version}");
-    }
-    if let Some(latest_version) = latest_version {
-        let _ = writeln!(report, "  Latest version   {latest_version}");
-    }
-    if let Some(detail) = detail {
-        let _ = writeln!(report, "  Detail           {detail}");
-    }
-    let trimmed = changelog.map(str::trim).filter(|value| !value.is_empty());
-    if let Some(changelog) = trimmed {
-        report.push_str(
-            "
-Changelog
-",
-        );
-        report.push_str(changelog);
-    }
-    report.trim_end().to_string()
-}
-
-fn compare_versions(left: &str, right: &str) -> std::cmp::Ordering {
-    let left = normalize_version_tag(left);
-    let right = normalize_version_tag(right);
-    let left_parts = version_components(&left);
-    let right_parts = version_components(&right);
-    let max_len = left_parts.len().max(right_parts.len());
-    for index in 0..max_len {
-        let left_part = *left_parts.get(index).unwrap_or(&0);
-        let right_part = *right_parts.get(index).unwrap_or(&0);
-        match left_part.cmp(&right_part) {
-            std::cmp::Ordering::Equal => {}
-            ordering => return ordering,
-        }
-    }
-    std::cmp::Ordering::Equal
-}
-
-fn version_components(version: &str) -> Vec<u64> {
-    version
-        .split(['.', '-'])
-        .map(|part| {
-            part.chars()
-                .take_while(char::is_ascii_digit)
-                .collect::<String>()
-        })
-        .filter(|part| !part.is_empty())
-        .filter_map(|part| part.parse::<u64>().ok())
-        .collect()
-}
-
-fn default_target_triple() -> String {
-    let os = match env::consts::OS {
-        "linux" => "unknown-linux-gnu",
-        "macos" => "apple-darwin",
-        "windows" => "pc-windows-msvc",
-        other => other,
-    };
-    format!("{}-{os}", env::consts::ARCH)
-}
-
-fn target_name_candidates() -> Vec<String> {
-    let mut candidates = Vec::new();
-    if let Some(target) = BUILD_TARGET {
-        candidates.push(target.to_string());
-    }
-    candidates.push(default_target_triple());
-    candidates.push(format!("{}-{}", env::consts::ARCH, env::consts::OS));
-    candidates
-}
-
 fn resume_session(session_path: &Path, commands: &[String]) {
     let session = match Session::load_from_path(session_path) {
         Ok(session) => session,
@@ -1091,26 +708,6 @@ fn format_resume_report(session_path: &str, message_count: usize, turns: u32) ->
     )
 }
 
-fn format_init_report(path: &Path, created: bool) -> String {
-    if created {
-        format!(
-            "Init
-  CLAUDE.md        {}
-  Result           created
-  Next step        Review and tailor the generated guidance",
-            path.display()
-        )
-    } else {
-        format!(
-            "Init
-  CLAUDE.md        {}
-  Result           skipped (already exists)
-  Next step        Edit the existing file intentionally if workflows changed",
-            path.display()
-        )
-    }
-}
-
 fn format_compact_report(removed: usize, resulting_messages: usize, skipped: bool) -> String {
     if skipped {
         format!(
@@ -1271,7 +868,6 @@ fn run_resume_command(
         | SlashCommand::Model { .. }
         | SlashCommand::Permissions { .. }
         | SlashCommand::Session { .. }
-        | SlashCommand::Thinking { .. }
         | SlashCommand::Unknown(_) => Err("unsupported resumed slash command".into()),
     }
 }
@@ -1439,7 +1035,6 @@ impl LiveCli {
             tools: None,
             tool_choice: None,
             stream: false,
-            thinking: None,
         };
         let runtime = tokio::runtime::Runtime::new()?;
         let response = runtime.block_on(client.send_message(&request))?;
@@ -1448,7 +1043,7 @@ impl LiveCli {
             .iter()
             .filter_map(|block| match block {
                 OutputContentBlock::Text { text } => Some(text.as_str()),
-                OutputContentBlock::ToolUse { .. } | OutputContentBlock::Thinking { .. } => None,
+                OutputContentBlock::ToolUse { .. } => None,
             })
             .collect::<Vec<_>>()
             .join("");
@@ -1502,7 +1097,7 @@ impl LiveCli {
                 false
             }
             SlashCommand::Init => {
-                Self::run_init()?;
+                run_init()?;
                 false
             }
             SlashCommand::Diff => {
@@ -1519,10 +1114,6 @@ impl LiveCli {
             }
             SlashCommand::Session { action, target } => {
                 self.handle_session_command(action.as_deref(), target.as_deref())?
-            }
-            SlashCommand::Thinking { .. } => {
-                println!("Thinking mode toggled.");
-                false
             }
             SlashCommand::Unknown(name) => {
                 eprintln!("unknown slash command: /{name}");
@@ -1711,11 +1302,6 @@ impl LiveCli {
 
     fn print_memory() -> Result<(), Box<dyn std::error::Error>> {
         println!("{}", render_memory_report()?);
-        Ok(())
-    }
-
-    fn run_init() -> Result<(), Box<dyn std::error::Error>> {
-        println!("{}", init_claude_md()?);
         Ok(())
     }
 
@@ -2116,67 +1702,12 @@ fn render_memory_report() -> Result<String, Box<dyn std::error::Error>> {
 
 fn init_claude_md() -> Result<String, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
-    let claude_md = cwd.join("CLAUDE.md");
-    if claude_md.exists() {
-        return Ok(format_init_report(&claude_md, false));
-    }
-
-    let content = render_init_claude_md(&cwd);
-    fs::write(&claude_md, content)?;
-    Ok(format_init_report(&claude_md, true))
+    Ok(initialize_repo(&cwd)?.render())
 }
 
-fn render_init_claude_md(cwd: &Path) -> String {
-    let mut lines = vec![
-        "# CLAUDE.md".to_string(),
-        String::new(),
-        "This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.".to_string(),
-        String::new(),
-    ];
-
-    let mut command_lines = Vec::new();
-    if cwd.join("rust").join("Cargo.toml").is_file() {
-        command_lines.push("- Run Rust verification from `rust/`: `cargo fmt`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`".to_string());
-    } else if cwd.join("Cargo.toml").is_file() {
-        command_lines.push("- Run Rust verification from the repo root: `cargo fmt`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`".to_string());
-    }
-    if cwd.join("tests").is_dir() && cwd.join("src").is_dir() {
-        command_lines.push("- `src/` and `tests/` are also present; check those surfaces before removing or renaming Python-era compatibility assets.".to_string());
-    }
-    if !command_lines.is_empty() {
-        lines.push("## Verification".to_string());
-        lines.extend(command_lines);
-        lines.push(String::new());
-    }
-
-    let mut structure_lines = Vec::new();
-    if cwd.join("rust").is_dir() {
-        structure_lines.push(
-            "- `rust/` contains the Rust workspace and the active CLI/runtime implementation."
-                .to_string(),
-        );
-    }
-    if cwd.join("src").is_dir() {
-        structure_lines.push("- `src/` contains the older Python-first workspace artifacts referenced by the repo history and tests.".to_string());
-    }
-    if cwd.join("tests").is_dir() {
-        structure_lines.push("- `tests/` exercises compatibility and porting behavior across the repository surfaces.".to_string());
-    }
-    if !structure_lines.is_empty() {
-        lines.push("## Repository shape".to_string());
-        lines.extend(structure_lines);
-        lines.push(String::new());
-    }
-
-    lines.push("## Working agreement".to_string());
-    lines.push("- Prefer small, reviewable Rust changes and keep slash-command behavior aligned between the shared command registry and the CLI entrypoints.".to_string());
-    lines.push("- Do not overwrite existing CLAUDE.md content automatically; update it intentionally when repo workflows change.".to_string());
-    lines.push(String::new());
-
-    lines.join(
-        "
-",
-    )
+fn run_init() -> Result<(), Box<dyn std::error::Error>> {
+    println!("{}", init_claude_md()?);
+    Ok(())
 }
 
 fn normalize_permission_mode(mode: &str) -> Option<&'static str> {
@@ -2240,11 +1771,6 @@ fn render_export_text(session: &Session) -> String {
                     lines.push(format!(
                         "[tool_result id={tool_use_id} name={tool_name} error={is_error}] {output}"
                     ));
-                }
-                ContentBlock::Thinking { text: thinking, .. } => {
-                    if !thinking.is_empty() {
-                        lines.push(format!("[thinking] {thinking}"));
-                    }
                 }
             }
         }
@@ -2434,7 +1960,6 @@ impl ApiClient for AnthropicRuntimeClient {
             }),
             tool_choice: self.enable_tools.then_some(ToolChoice::Auto),
             stream: true,
-            thinking: None,
         };
 
         self.runtime.block_on(async {
@@ -2481,8 +2006,6 @@ impl ApiClient for AnthropicRuntimeClient {
                                 input.push_str(&partial_json);
                             }
                         }
-                        ContentBlockDelta::ThinkingDelta { .. }
-                        | ContentBlockDelta::SignatureDelta { .. } => {}
                     },
                     ApiStreamEvent::ContentBlockStop(_) => {
                         if let Some((id, name, input)) = pending_tool.take() {
@@ -2616,7 +2139,6 @@ fn push_output_block(
             .map_err(|error| RuntimeError::new(error.to_string()))?;
             *pending_tool = Some((id, name, input.to_string()));
         }
-        OutputContentBlock::Thinking { .. } => {}
     }
     Ok(())
 }
@@ -2734,7 +2256,6 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
                         }],
                         is_error: *is_error,
                     },
-                    ContentBlock::Thinking { .. } => InputContentBlock::Text { text: String::new() },
                 })
                 .collect::<Vec<_>>();
             (!content.is_empty()).then(|| InputMessage {
@@ -2745,36 +2266,65 @@ fn convert_messages(messages: &[ConversationMessage]) -> Vec<InputMessage> {
         .collect()
 }
 
-fn print_help() {
-    println!("rusty-claude-cli v{VERSION}");
-    println!();
-    println!("Usage:");
-    println!("  rusty-claude-cli [--model MODEL] [--allowedTools TOOL[,TOOL...]]");
-    println!("      Start the interactive REPL");
-    println!("  rusty-claude-cli [--model MODEL] [--output-format text|json] prompt TEXT");
-    println!("      Send one prompt and exit");
-    println!("  rusty-claude-cli [--model MODEL] [--output-format text|json] TEXT");
-    println!("      Shorthand non-interactive prompt mode");
-    println!("  rusty-claude-cli --resume SESSION.json [/status] [/compact] [...]");
-    println!("      Inspect or maintain a saved session without entering the REPL");
-    println!("  rusty-claude-cli dump-manifests");
-    println!("  rusty-claude-cli bootstrap-plan");
-    println!("  rusty-claude-cli system-prompt [--cwd PATH] [--date YYYY-MM-DD]");
-    println!("  rusty-claude-cli login");
-    println!("  rusty-claude-cli logout");
-    println!("  rusty-claude-cli self-update");
-    println!("      Update the installed binary from the latest GitHub release");
-    println!();
-    println!("Flags:");
-    println!("  --model MODEL              Override the active model");
-    println!("  --output-format FORMAT     Non-interactive output format: text or json");
-    println!("  --permission-mode MODE     Set read-only, workspace-write, or danger-full-access");
-    println!("  --allowedTools TOOLS       Restrict enabled tools (repeatable; comma-separated aliases supported)");
-    println!("  --version, -V              Print version and build information locally");
-    println!();
-    println!("Interactive slash commands:");
-    println!("{}", render_slash_command_help());
-    println!();
+fn print_help_to(out: &mut impl Write) -> io::Result<()> {
+    writeln!(out, "rusty-claude-cli v{VERSION}")?;
+    writeln!(out)?;
+    writeln!(out, "Usage:")?;
+    writeln!(
+        out,
+        "  rusty-claude-cli [--model MODEL] [--allowedTools TOOL[,TOOL...]]"
+    )?;
+    writeln!(out, "      Start the interactive REPL")?;
+    writeln!(
+        out,
+        "  rusty-claude-cli [--model MODEL] [--output-format text|json] prompt TEXT"
+    )?;
+    writeln!(out, "      Send one prompt and exit")?;
+    writeln!(
+        out,
+        "  rusty-claude-cli [--model MODEL] [--output-format text|json] TEXT"
+    )?;
+    writeln!(out, "      Shorthand non-interactive prompt mode")?;
+    writeln!(
+        out,
+        "  rusty-claude-cli --resume SESSION.json [/status] [/compact] [...]"
+    )?;
+    writeln!(
+        out,
+        "      Inspect or maintain a saved session without entering the REPL"
+    )?;
+    writeln!(out, "  rusty-claude-cli dump-manifests")?;
+    writeln!(out, "  rusty-claude-cli bootstrap-plan")?;
+    writeln!(
+        out,
+        "  rusty-claude-cli system-prompt [--cwd PATH] [--date YYYY-MM-DD]"
+    )?;
+    writeln!(out, "  rusty-claude-cli login")?;
+    writeln!(out, "  rusty-claude-cli logout")?;
+    writeln!(out, "  rusty-claude-cli init")?;
+    writeln!(out)?;
+    writeln!(out, "Flags:")?;
+    writeln!(
+        out,
+        "  --model MODEL              Override the active model"
+    )?;
+    writeln!(
+        out,
+        "  --output-format FORMAT     Non-interactive output format: text or json"
+    )?;
+    writeln!(
+        out,
+        "  --permission-mode MODE     Set read-only, workspace-write, or danger-full-access"
+    )?;
+    writeln!(out, "  --allowedTools TOOLS       Restrict enabled tools (repeatable; comma-separated aliases supported)")?;
+    writeln!(
+        out,
+        "  --version, -V              Print version and build information locally"
+    )?;
+    writeln!(out)?;
+    writeln!(out, "Interactive slash commands:")?;
+    writeln!(out, "{}", render_slash_command_help())?;
+    writeln!(out)?;
     let resume_commands = resume_supported_slash_commands()
         .into_iter()
         .map(|spec| match spec.argument_hint {
@@ -2783,30 +2333,46 @@ fn print_help() {
         })
         .collect::<Vec<_>>()
         .join(", ");
-    println!("Resume-safe commands: {resume_commands}");
-    println!("Examples:");
-    println!("  rusty-claude-cli --model claude-opus \"summarize this repo\"");
-    println!("  rusty-claude-cli --output-format json prompt \"explain src/main.rs\"");
-    println!("  rusty-claude-cli --allowedTools read,glob \"summarize Cargo.toml\"");
-    println!("  rusty-claude-cli --resume session.json /status /diff /export notes.txt");
-    println!("  rusty-claude-cli login");
-    println!("  rusty-claude-cli self-update");
+    writeln!(out, "Resume-safe commands: {resume_commands}")?;
+    writeln!(out, "Examples:")?;
+    writeln!(
+        out,
+        "  rusty-claude-cli --model claude-opus \"summarize this repo\""
+    )?;
+    writeln!(
+        out,
+        "  rusty-claude-cli --output-format json prompt \"explain src/main.rs\""
+    )?;
+    writeln!(
+        out,
+        "  rusty-claude-cli --allowedTools read,glob \"summarize Cargo.toml\""
+    )?;
+    writeln!(
+        out,
+        "  rusty-claude-cli --resume session.json /status /diff /export notes.txt"
+    )?;
+    writeln!(out, "  rusty-claude-cli login")?;
+    writeln!(out, "  rusty-claude-cli init")?;
+    Ok(())
+}
+
+fn print_help() {
+    let _ = print_help_to(&mut io::stdout());
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        filter_tool_specs, format_compact_report, format_cost_report, format_init_report,
-        format_model_report, format_model_switch_report, format_permissions_report,
-        format_permissions_switch_report, format_resume_report, format_status_report,
-        format_tool_call_start, format_tool_result, is_newer_version, normalize_permission_mode,
-        normalize_version_tag, parse_args, parse_checksum_for_asset, parse_git_status_metadata,
-        render_config_report, render_init_claude_md, render_memory_report, render_repl_help,
-        render_update_report, resume_supported_slash_commands, select_release_assets,
-        status_context, CliAction, CliOutputFormat, SlashCommand, StatusUsage, DEFAULT_MODEL,
+        filter_tool_specs, format_compact_report, format_cost_report, format_model_report,
+        format_model_switch_report, format_permissions_report, format_permissions_switch_report,
+        format_resume_report, format_status_report, format_tool_call_start, format_tool_result,
+        normalize_permission_mode, parse_args, parse_git_status_metadata, print_help_to,
+        render_config_report, render_memory_report, render_repl_help,
+        resume_supported_slash_commands, status_context, CliAction, CliOutputFormat, SlashCommand,
+        StatusUsage, DEFAULT_MODEL,
     };
     use runtime::{ContentBlock, ConversationMessage, MessageRole, PermissionMode};
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
     #[test]
     fn defaults_to_repl_when_no_args() {
@@ -2870,64 +2436,6 @@ mod tests {
             parse_args(&["-V".to_string()]).expect("args should parse"),
             CliAction::Version
         );
-    }
-
-    #[test]
-    fn parses_self_update_subcommand() {
-        assert_eq!(
-            parse_args(&["self-update".to_string()]).expect("self-update should parse"),
-            CliAction::SelfUpdate
-        );
-    }
-
-    #[test]
-    fn normalize_version_tag_trims_v_prefix() {
-        assert_eq!(normalize_version_tag("v0.1.0"), "0.1.0");
-        assert_eq!(normalize_version_tag("0.1.0"), "0.1.0");
-    }
-
-    #[test]
-    fn detects_when_latest_version_differs() {
-        assert!(!is_newer_version("0.1.0", "v0.1.0"));
-        assert!(is_newer_version("0.1.0", "v0.2.0"));
-    }
-
-    #[test]
-    fn parses_checksum_manifest_for_named_asset() {
-        let manifest = "abc123 *rusty-claude-cli\ndef456  other-file\n";
-        assert_eq!(
-            parse_checksum_for_asset(manifest, "rusty-claude-cli"),
-            Some("abc123".to_string())
-        );
-    }
-
-    #[test]
-    fn select_release_assets_requires_checksum_file() {
-        let release = super::GitHubRelease {
-            tag_name: "v0.2.0".to_string(),
-            body: String::new(),
-            assets: vec![super::GitHubReleaseAsset {
-                name: "rusty-claude-cli".to_string(),
-                browser_download_url: "https://example.invalid/rusty-claude-cli".to_string(),
-            }],
-        };
-
-        let error = select_release_assets(&release).expect_err("missing checksum should error");
-        assert!(error.contains("checksum manifest"));
-    }
-
-    #[test]
-    fn update_report_includes_changelog_when_present() {
-        let report = render_update_report(
-            "Already up to date",
-            Some("0.1.0"),
-            Some("0.1.0"),
-            Some("No action taken."),
-            Some("- Added self-update"),
-        );
-        assert!(report.contains("Self-update"));
-        assert!(report.contains("Changelog"));
-        assert!(report.contains("- Added self-update"));
     }
 
     #[test]
@@ -2999,6 +2507,10 @@ mod tests {
         assert_eq!(
             parse_args(&["logout".to_string()]).expect("logout should parse"),
             CliAction::Logout
+        );
+        assert_eq!(
+            parse_args(&["init".to_string()]).expect("init should parse"),
+            CliAction::Init
         );
     }
 
@@ -3154,12 +2666,11 @@ mod tests {
     }
 
     #[test]
-    fn init_report_uses_structured_output() {
-        let created = format_init_report(Path::new("/tmp/CLAUDE.md"), true);
-        assert!(created.contains("Init"));
-        assert!(created.contains("Result           created"));
-        let skipped = format_init_report(Path::new("/tmp/CLAUDE.md"), false);
-        assert!(skipped.contains("skipped (already exists)"));
+    fn init_help_mentions_direct_subcommand() {
+        let mut help = Vec::new();
+        print_help_to(&mut help).expect("help should render");
+        let help = String::from_utf8(help).expect("help should be utf8");
+        assert!(help.contains("rusty-claude-cli init"));
     }
 
     #[test]
@@ -3263,7 +2774,7 @@ mod tests {
     fn status_context_reads_real_workspace_metadata() {
         let context = status_context(None).expect("status context should load");
         assert!(context.cwd.is_absolute());
-        assert!(context.discovered_config_files >= 3);
+        assert_eq!(context.discovered_config_files, 5);
         assert!(context.loaded_config_files <= context.discovered_config_files);
     }
 
@@ -3321,7 +2832,7 @@ mod tests {
 
     #[test]
     fn init_template_mentions_detected_rust_workspace() {
-        let rendered = render_init_claude_md(Path::new("."));
+        let rendered = crate::init::render_init_claude_md(std::path::Path::new("."));
         assert!(rendered.contains("# CLAUDE.md"));
         assert!(rendered.contains("cargo clippy --workspace --all-targets -- -D warnings"));
     }
