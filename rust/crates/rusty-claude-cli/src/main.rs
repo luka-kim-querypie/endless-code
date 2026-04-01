@@ -11,7 +11,7 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use api::{
-    resolve_saved_oauth_token, AnthropicClient, AuthSource, ContentBlockDelta, InputContentBlock,
+    resolve_startup_auth_source, AnthropicClient, AuthSource, ContentBlockDelta, InputContentBlock,
     InputMessage, MessageRequest, MessageResponse, OutputContentBlock,
     StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
@@ -1878,20 +1878,13 @@ impl AnthropicRuntimeClient {
 }
 
 fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
-    match AuthSource::from_env() {
-        Ok(auth) => Ok(auth),
-        Err(api::ApiError::MissingApiKey) => {
-            let cwd = env::current_dir()?;
-            let config = ConfigLoader::default_for(&cwd).load()?;
-            if let Some(oauth) = config.oauth() {
-                if let Some(token_set) = resolve_saved_oauth_token(oauth)? {
-                    return Ok(AuthSource::from(token_set));
-                }
-            }
-            Ok(AuthSource::from_env_or_saved()?)
-        }
-        Err(error) => Err(Box::new(error)),
-    }
+    Ok(resolve_startup_auth_source(|| {
+        let cwd = env::current_dir().map_err(api::ApiError::from)?;
+        let config = ConfigLoader::default_for(&cwd).load().map_err(|error| {
+            api::ApiError::Auth(format!("failed to load runtime OAuth config: {error}"))
+        })?;
+        Ok(config.oauth().cloned())
+    })?)
 }
 
 impl ApiClient for AnthropicRuntimeClient {
