@@ -2973,53 +2973,8 @@ fn todo_store_path() -> Result<std::path::PathBuf, String> {
 }
 
 fn resolve_skill_path(skill: &str) -> Result<std::path::PathBuf, String> {
-    let requested = skill.trim().trim_start_matches('/').trim_start_matches('$');
-    if requested.is_empty() {
-        return Err(String::from("skill must not be empty"));
-    }
-
-    let mut candidates = Vec::new();
-    if let Ok(claw_config_home) = std::env::var("CLAW_CONFIG_HOME") {
-        candidates.push(std::path::PathBuf::from(claw_config_home).join("skills"));
-    }
-    if let Ok(codex_home) = std::env::var("CODEX_HOME") {
-        candidates.push(std::path::PathBuf::from(codex_home).join("skills"));
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        let home = std::path::PathBuf::from(home);
-        candidates.push(home.join(".claw").join("skills"));
-        candidates.push(home.join(".agents").join("skills"));
-        candidates.push(home.join(".config").join("opencode").join("skills"));
-        candidates.push(home.join(".codex").join("skills"));
-        candidates.push(home.join(".claude").join("skills"));
-    }
-    candidates.push(std::path::PathBuf::from("/home/bellman/.claw/skills"));
-    candidates.push(std::path::PathBuf::from("/home/bellman/.codex/skills"));
-
-    for root in candidates {
-        let direct = root.join(requested).join("SKILL.md");
-        if direct.exists() {
-            return Ok(direct);
-        }
-
-        if let Ok(entries) = std::fs::read_dir(&root) {
-            for entry in entries.flatten() {
-                let path = entry.path().join("SKILL.md");
-                if !path.exists() {
-                    continue;
-                }
-                if entry
-                    .file_name()
-                    .to_string_lossy()
-                    .eq_ignore_ascii_case(requested)
-                {
-                    return Ok(path);
-                }
-            }
-        }
-    }
-
-    Err(format!("unknown skill: {requested}"))
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    commands::resolve_skill_path(&cwd, skill).map_err(|error| error.to_string())
 }
 
 const DEFAULT_AGENT_MODEL: &str = "claude-opus-4-6";
@@ -5795,6 +5750,50 @@ mod tests {
             std::env::remove_var("HOME");
         }
         fs::remove_dir_all(home).expect("temp home should clean up");
+    }
+
+    #[test]
+    fn skill_resolves_project_local_skills_and_legacy_commands() {
+        let _guard = env_lock().lock().expect("env lock should acquire");
+        let root = temp_path("project-skills");
+        let skill_dir = root.join(".claw").join("skills").join("plan");
+        let command_dir = root.join(".claw").join("commands");
+        fs::create_dir_all(&skill_dir).expect("skill dir should exist");
+        fs::create_dir_all(&command_dir).expect("command dir should exist");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: plan\ndescription: Project planning guidance\n---\n\n# plan\n",
+        )
+        .expect("skill file should exist");
+        fs::write(
+            command_dir.join("handoff.md"),
+            "---\nname: handoff\ndescription: Legacy handoff guidance\n---\n\n# handoff\n",
+        )
+        .expect("command file should exist");
+
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let skill_result = execute_tool("Skill", &json!({ "skill": "$plan" }))
+            .expect("project-local skill should resolve");
+        let skill_output: serde_json::Value =
+            serde_json::from_str(&skill_result).expect("valid json");
+        assert!(skill_output["path"]
+            .as_str()
+            .expect("path")
+            .ends_with(".claw/skills/plan/SKILL.md"));
+
+        let command_result = execute_tool("Skill", &json!({ "skill": "/handoff" }))
+            .expect("legacy command should resolve");
+        let command_output: serde_json::Value =
+            serde_json::from_str(&command_result).expect("valid json");
+        assert!(command_output["path"]
+            .as_str()
+            .expect("path")
+            .ends_with(".claw/commands/handoff.md"));
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        fs::remove_dir_all(root).expect("temp project should clean up");
     }
 
     #[test]
