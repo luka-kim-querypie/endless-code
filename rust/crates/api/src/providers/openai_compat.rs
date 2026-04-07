@@ -16,6 +16,7 @@ use super::{preflight_message_request, Provider, ProviderFuture};
 
 pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";
 pub const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
+pub const DEFAULT_GROQ_BASE_URL: &str = "https://api.groq.com/openai/v1";
 const REQUEST_ID_HEADER: &str = "request-id";
 const ALT_REQUEST_ID_HEADER: &str = "x-request-id";
 const DEFAULT_INITIAL_BACKOFF: Duration = Duration::from_millis(200);
@@ -32,6 +33,7 @@ pub struct OpenAiCompatConfig {
 
 const XAI_ENV_VARS: &[&str] = &["XAI_API_KEY"];
 const OPENAI_ENV_VARS: &[&str] = &["OPENAI_API_KEY"];
+const GROQ_ENV_VARS: &[&str] = &["GROQ_API_KEY"];
 
 impl OpenAiCompatConfig {
     #[must_use]
@@ -53,11 +55,23 @@ impl OpenAiCompatConfig {
             default_base_url: DEFAULT_OPENAI_BASE_URL,
         }
     }
+
+    #[must_use]
+    pub const fn groq() -> Self {
+        Self {
+            provider_name: "Groq",
+            api_key_env: "GROQ_API_KEY",
+            base_url_env: "GROQ_BASE_URL",
+            default_base_url: DEFAULT_GROQ_BASE_URL,
+        }
+    }
+
     #[must_use]
     pub fn credential_env_vars(self) -> &'static [&'static str] {
         match self.provider_name {
             "xAI" => XAI_ENV_VARS,
             "OpenAI" => OPENAI_ENV_VARS,
+            "Groq" => GROQ_ENV_VARS,
             _ => &[],
         }
     }

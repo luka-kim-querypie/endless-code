@@ -1,6 +1,6 @@
-# 🦞 Claw Code — Rust Implementation
+# 🦞 Endless Code — Rust Implementation
 
-A high-performance Rust rewrite of the Claw Code CLI agent harness. Built for speed, safety, and native tool execution.
+A high-performance Rust workspace for the Endless Code agent harness. It keeps the upstream-compatible `claw` CLI while adding Endless-specific integration surfaces such as Slack thread orchestration.
 
 For a task-oriented guide with copy/paste examples, see [`../USAGE.md`](../USAGE.md).
 
@@ -102,6 +102,7 @@ Primary artifacts:
 | Plugin management surfaces | ✅ |
 | Skills inventory / install surfaces | ✅ |
 | Machine-readable JSON output across core CLI surfaces | ✅ |
+| Slack thread bridge (`endless-slack`) | ✅ |
 
 ## Model Aliases
 
@@ -184,6 +185,7 @@ rust/
     ├── api/                # Provider clients + streaming + request preflight
     ├── commands/           # Shared slash-command registry + help rendering
     ├── compat-harness/     # TS manifest extraction harness
+    ├── endless-slack/      # Slack Events API bridge with thread-scoped sessions
     ├── mock-anthropic-service/ # Deterministic local Anthropic-compatible mock
     ├── plugins/            # Plugin metadata, manager, install/enable/disable surfaces
     ├── runtime/            # Session, config, permissions, MCP, prompts, auth/runtime loop
@@ -197,6 +199,7 @@ rust/
 - **api** — provider clients, SSE streaming, request/response types, auth (API key + OAuth bearer), request-size/context-window preflight
 - **commands** — slash command definitions, parsing, help text generation, JSON/text command rendering
 - **compat-harness** — extracts tool/prompt manifests from upstream TS source
+- **endless-slack** — Slack Events API adapter that maps Slack threads to persistent local agent sessions
 - **mock-anthropic-service** — deterministic `/v1/messages` mock for CLI parity tests and local harness runs
 - **plugins** — plugin metadata, install/enable/disable/update flows, plugin tool definitions, hook integration surfaces
 - **runtime** — `ConversationRuntime`, config loading, session persistence, permission policy, MCP client lifecycle, system prompt assembly, usage tracking

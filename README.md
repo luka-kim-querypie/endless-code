@@ -1,7 +1,7 @@
-# Claw Code
+# Endless Code
 
 <p align="center">
-  <a href="https://github.com/ultraworkers/claw-code">ultraworkers/claw-code</a>
+  <a href="https://github.com/luka-kim-querypie/endless-code">luka-kim-querypie/endless-code</a>
   ·
   <a href="./USAGE.md">Usage</a>
   ·
@@ -25,23 +25,31 @@
 </p>
 
 <p align="center">
-  <img src="assets/claw-hero.jpeg" alt="Claw Code" width="300" />
+  <img src="assets/claw-hero.jpeg" alt="Endless Code" width="300" />
 </p>
 
-Claw Code is the public Rust implementation of the `claw` CLI agent harness.
-The canonical implementation lives in [`rust/`](./rust), and the current source of truth for this repository is **ultraworkers/claw-code**.
+Endless Code is a Slack-native fork of the `claw` CLI agent harness, aimed at multi-LLM operation and thread-based collaboration from Slack.
+It preserves the upstream Rust workspace under [`rust/`](./rust) while adding Endless-specific provider and Slack workflow surfaces in this fork.
 
 > [!IMPORTANT]
 > Start with [`USAGE.md`](./USAGE.md) for build, auth, CLI, session, and parity-harness workflows. Make `claw doctor` your first health check after building, use [`rust/README.md`](./rust/README.md) for crate-level details, read [`PARITY.md`](./PARITY.md) for the current Rust-port checkpoint, and see [`docs/container.md`](./docs/container.md) for the container-first workflow.
 
 ## Current repository shape
 
-- **`rust/`** — canonical Rust workspace and the `claw` CLI binary
+- **`rust/`** — canonical Rust workspace, the upstream-compatible `claw` CLI, and the `endless-slack` bridge
 - **`USAGE.md`** — task-oriented usage guide for the current product surface
 - **`PARITY.md`** — Rust-port parity status and migration notes
 - **`ROADMAP.md`** — active roadmap and cleanup backlog
 - **`PHILOSOPHY.md`** — project intent and system-design framing
 - **`src/` + `tests/`** — companion Python/reference workspace and audit helpers; not the primary runtime surface
+
+## Endless additions
+
+- **Multi-LLM routing** — Anthropic, OpenAI, xAI, and OpenAI-compatible backends selected by model plus env-based base URLs
+- **Slack thread sessions** — a new `endless-slack` binary runs the agent loop behind Slack Events API and persists one conversation per thread
+- **Per-thread model control** — switch models in Slack with `/model <name>`, inspect state with `/status`, and reset with `/reset`
+
+See [`docs/slack.md`](./docs/slack.md) for the Slack bridge setup.
 
 ## Quick start
 

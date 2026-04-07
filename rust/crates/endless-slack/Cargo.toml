@@ -1,0 +1,27 @@
+[package]
+name = "endless-slack"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "endless-slack"
+path = "src/main.rs"
+
+[dependencies]
+api = { path = "../api" }
+axum = "0.7"
+hex = "0.4"
+hmac = "0.12"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+runtime = { path = "../runtime" }
+serde = { version = "1", features = ["derive"] }
+serde_json.workspace = true
+sha2 = "0.10"
+tokio = { version = "1", features = ["fs", "macros", "net", "rt-multi-thread", "sync"] }
+tools = { path = "../tools" }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[lints]
+workspace = true

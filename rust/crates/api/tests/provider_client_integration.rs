@@ -46,6 +46,20 @@ fn provider_client_uses_explicit_anthropic_auth_without_env_lookup() {
 }
 
 #[test]
+fn provider_client_routes_unknown_models_through_groq_when_groq_key_is_present() {
+    let _lock = env_lock();
+    let _anthropic_api_key = EnvVarGuard::set("ANTHROPIC_API_KEY", None);
+    let _openai_api_key = EnvVarGuard::set("OPENAI_API_KEY", None);
+    let _xai_api_key = EnvVarGuard::set("XAI_API_KEY", None);
+    let _groq_api_key = EnvVarGuard::set("GROQ_API_KEY", Some("groq-test-key"));
+
+    let client = ProviderClient::from_model("llama-3.3-70b-versatile")
+        .expect("unknown model should route through Groq when only GROQ_API_KEY is present");
+
+    assert_eq!(client.provider_kind(), ProviderKind::Groq);
+}
+
+#[test]
 fn read_xai_base_url_prefers_env_override() {
     let _lock = env_lock();
     let _xai_base_url = EnvVarGuard::set("XAI_BASE_URL", Some("https://example.xai.test/v1"));
